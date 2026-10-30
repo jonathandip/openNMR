@@ -7,7 +7,7 @@ correction, referencing and annotation, then produces a publication figure and a
 multiplet report. It is built with Tauri 2, Svelte 5, TypeScript and a Rust
 numerical core.
 
-> **Status: early pre-release (0.1.0).** openNMR is under active development.
+> **Status: early pre-release (0.1.1).** openNMR is under active development.
 > Its processing and fitted areas have not been validated for general research
 > use. Check the phase, baseline, referencing and integrations before relying on
 > any result. Release builds are currently unsigned; macOS builds are not
