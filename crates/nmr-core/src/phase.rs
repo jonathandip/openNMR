@@ -27,12 +27,6 @@ const ROLL_POINTS: f64 = 32.0;
 /// in ppm of the nucleus, for anything but ¹H and ¹⁹F (Zorin et al.: 0.056 ppm,
 /// 7 Hz for ¹³C at 125 MHz): lines a point or two wide phase badly on their own.
 const SMOOTH_PPM: f64 = 0.056;
-/// In an experiment with lines of both signs, a region further than this in
-/// degrees from the one holding the tallest line is taken to point down (Zorin
-/// et al.).
-const SIGNED_DEGREES: f64 = 135.0;
-/// Below this correlation the first order is taken to be zero (Zorin et al.).
-const MIN_CORRELATION: f64 = 0.2;
 /// The first order searched for either way, in degrees.
 const MAX_P1: i32 = 720;
 /// A maximum counts as a peak of its region when it stands this many times the
@@ -45,7 +39,9 @@ const REGION_PEAK_SIGMA: f64 = 5.0;
 /// given the zero-order phase that leaves least area under the line between its
 /// edges, and `p0 + p1 k/n` is fitted through those phases weighted by the
 /// peaks in each, dropping outliers. `meta` gives the spacing of the points,
-/// the nucleus, and whether the experiment has lines of both signs.
+/// the nucleus, and whether the experiment has lines of both signs. The fitted
+/// first order is refined within each region before its local phase is measured
+/// again, so the phase really refers to the region midpoint.
 ///
 /// Weighted by the square root of each region's peaks rather than the peaks
 /// themselves: on the datasets in `testdata` the water and solvent regions
@@ -53,10 +49,9 @@ const REGION_PEAK_SIGMA: f64 = 5.0;
 /// the signals missed the one the operator recorded by up to 24°, where it now
 /// misses by 6° at most (2.5° on average), misphased on purpose or not. The
 /// peak-argument fit this replaces was 180° out on one of them. In an APT or a
-/// DEPT a region more than 135° from the one holding the tallest line is turned
-/// over, as the paper does, which holds the first order to ±90°. The tallest
-/// line, not the heaviest region: two CH2 lines side by side outweighed the
-/// tallest CH and turned the whole spectrum over.
+/// DEPT phases are fitted modulo 180° within ±90° of first order, with the
+/// tallest line taken to point up. The tallest line, not the heaviest region:
+/// two CH2 lines side by side can outweigh the tallest CH.
 pub fn auto_phase(data: &[Complex64], meta: &Metadata) -> (f64, f64) {
     let n = data.len();
     let hz_per_point = meta.sw_hz / n as f64;
@@ -102,63 +97,73 @@ pub fn auto_phase(data: &[Complex64], meta: &Metadata) -> (f64, f64) {
     };
     let phased = smooth.as_deref().unwrap_or(data);
     let edge = (4 * reach).max(4);
-    let mut found: Vec<(f64, f64, f64)> = Vec::new();
-    // The phase of the region holding the tallest line, and that line's height.
-    let mut tallest = (0.0, f64::NEG_INFINITY);
-    for (from, to) in blocks {
-        // Its edges have to be baseline for the line under it to be right.
-        if from < gap || to + gap > n {
-            continue;
-        }
-        let (from, to) = (from - gap / 2, (to + gap / 2).min(n));
-        let floor = (magnitude[from].max(magnitude[to - 1])).max(0.0);
-        let weight: f64 = (from + 3..to.saturating_sub(3))
-            .filter(|&i| (i - 3..=i + 3).all(|j| magnitude[j] <= magnitude[i]))
-            .map(|i| magnitude[i] - floor)
-            .filter(|h| *h > REGION_PEAK_SIGMA * level)
-            .sum();
-        if weight <= 0.0 || to - from <= 8 {
-            continue;
-        }
-        // A long noise correlation estimate must not consume the whole region.
-        let phase = region_phase(&phased[from..to], edge.min(((to - from) / 4).max(4)));
-        let top = magnitude[from..to].iter().copied().fold(0.0, f64::max);
-        if top > tallest.1 {
-            tallest = (phase, top);
-        }
-        found.push(((from + to) as f64 / 2.0 / n as f64, phase, weight.sqrt()));
-    }
-    if found.is_empty() {
-        return (0.0, 0.0);
-    }
-    // The tallest line is taken to point up, as the paper takes it.
-    if meta.signed {
-        for f in &mut found {
-            if ((f.1 - tallest.0 + 180.0).rem_euclid(360.0) - 180.0).abs() > SIGNED_DEGREES {
-                f.1 += 180.0;
+    // Remove the estimated slope within each region before measuring its phase
+    // at the midpoint; a constant rotation otherwise biases asymmetric regions.
+    let mut slope = 0.0;
+    let mut result = (0.0, 0.0);
+    for _ in 0..5 {
+        let mut found: Vec<(f64, f64, f64)> = Vec::new();
+        // The phase of the region holding the tallest line, and that line's height.
+        let mut tallest = (0.0, 0.0, f64::NEG_INFINITY);
+        for &(from, to) in &blocks {
+            // Its edges have to be baseline for the line under it to be right.
+            if from < gap || to + gap > n {
+                continue;
             }
+            let (from, to) = (from - gap / 2, (to + gap / 2).min(n));
+            let floor = (magnitude[from].max(magnitude[to - 1])).max(0.0);
+            let weight: f64 = (from + 3..to.saturating_sub(3))
+                .filter(|&i| (i - 3..=i + 3).all(|j| magnitude[j] <= magnitude[i]))
+                .map(|i| magnitude[i] - floor)
+                .filter(|h| *h > REGION_PEAK_SIGMA * level)
+                .sum();
+            if weight <= 0.0 || to - from <= 8 {
+                continue;
+            }
+            // A long noise correlation estimate must not consume the whole region.
+            let mut region = phased[from..to].to_vec();
+            apply(&mut region, 0.0, slope * (to - from) as f64 / n as f64, 0.5);
+            let phase = region_phase(&region, edge.min(((to - from) / 4).max(4)));
+            let top = magnitude[from..to].iter().copied().fold(0.0, f64::max);
+            if top > tallest.2 {
+                tallest = ((from + to) as f64 / 2.0 / n as f64, phase, top);
+            }
+            found.push(((from + to) as f64 / 2.0 / n as f64, phase, weight.sqrt()));
         }
+        if found.is_empty() {
+            return (0.0, 0.0);
+        }
+        // Unwrapped against a line fitted round the circle, each phase within half a
+        // turn of it. Unwrapping each within half a turn of the last, as the paper
+        // does, gained a turn at every jump of more than 180° between neighbours: on
+        // a ¹³C whose regions scatter by ±80° that summed to a first order of -627°
+        // where -85° was recorded, and the spectrum came out upside down.
+        let (mut c0, c1) = circular_fit(&found, meta.signed);
+        let period = if meta.signed { 180.0 } else { 360.0 };
+        if meta.signed {
+            // Negative lines differ by half a turn; the tallest fixes the overall sign.
+            c0 += 180.0 * ((tallest.1 - c0 - c1 * tallest.0) / 180.0).round();
+        }
+        for f in &mut found {
+            f.1 += period * ((c0 + c1 * f.0 - f.1) / period).round();
+        }
+        let (p0, p1) = regress(&mut found, if meta.signed { 90.0 } else { f64::INFINITY });
+        // A slope beyond the range the circle was searched over is the regions
+        // agreeing by accident, not a phase: the ⁸⁷Rb in `testdata`, one broad line
+        // and three specks, fitted PH1 = 1292°, right at the line and rolling
+        // everywhere else. The heaviest region alone then gives the zero order.
+        if p1.abs() > f64::from(MAX_P1) {
+            let heaviest = found.iter().max_by(|a, b| a.2.total_cmp(&b.2));
+            let p0 = heaviest.map_or(0.0, |f| f.1);
+            return ((p0 + 180.0).rem_euclid(360.0) - 180.0, 0.0);
+        }
+        result = ((p0 + 180.0).rem_euclid(360.0) - 180.0, p1);
+        if (p1 - slope).abs() < 0.05 {
+            break;
+        }
+        slope = p1;
     }
-    // Unwrapped against a line fitted round the circle, each phase within half a
-    // turn of it. Unwrapping each within half a turn of the last, as the paper
-    // does, gained a turn at every jump of more than 180° between neighbours: on
-    // a ¹³C whose regions scatter by ±80° that summed to a first order of -627°
-    // where -85° was recorded, and the spectrum came out upside down.
-    let (c0, c1) = circular_fit(&found);
-    for f in &mut found {
-        f.1 += 360.0 * ((c0 + c1 * f.0 - f.1) / 360.0).round();
-    }
-    let (p0, p1) = regress(&mut found);
-    // A slope beyond the range the circle was searched over is the regions
-    // agreeing by accident, not a phase: the ⁸⁷Rb in `testdata`, one broad line
-    // and three specks, fitted PH1 = 1292°, right at the line and rolling
-    // everywhere else. The heaviest region alone then gives the zero order.
-    if p1.abs() > f64::from(MAX_P1) {
-        let heaviest = found.iter().max_by(|a, b| a.2.total_cmp(&b.2));
-        let p0 = heaviest.map_or(0.0, |f| f.1);
-        return ((p0 + 180.0).rem_euclid(360.0) - 180.0, 0.0);
-    }
-    ((p0 + 180.0).rem_euclid(360.0) - 180.0, p1)
+    result
 }
 
 /// Holoborodko's smooth noise-robust differentiator for eleven points, the one
@@ -229,18 +234,32 @@ fn spread(values: &[f64], quiet: &[bool]) -> (f64, f64) {
 
 /// How many neighbouring points the noise stays alike over: twice the shift at
 /// which its autocorrelation falls below 0.6 of its value at none (Zorin et al.
-/// Eqs. 6-7), measured on the real part where both points are baseline.
+/// Eqs. 6-7), measured on both channels where both points are baseline.
+/// Using both keeps the estimate unchanged by a zero-order phase rotation.
 fn correlation_length(data: &[Complex64], quiet: &[bool]) -> usize {
     // Less the baseline's slow roll, which is alike over hundreds of points and
     // on its own kept the correlation above 0.6 as far as it was measured.
     let real: Vec<f64> = data.iter().map(|z| z.re).collect();
-    let slow = blur(&real, ROLL_POINTS);
-    let values: Vec<f64> = real.iter().zip(&slow).map(|(v, s)| v - s).collect();
-    let (mean, _) = spread(&values, quiet);
+    let imag: Vec<f64> = data.iter().map(|z| z.im).collect();
+    let slow_re = blur(&real, ROLL_POINTS);
+    let slow_im = blur(&imag, ROLL_POINTS);
+    let values: Vec<Complex64> = data
+        .iter()
+        .zip(slow_re.iter().zip(&slow_im))
+        .map(|(z, (re, im))| z - Complex64::new(*re, *im))
+        .collect();
+    let (count, sum) = values
+        .iter()
+        .zip(quiet)
+        .filter(|(_, q)| **q)
+        .fold((0usize, Complex64::ZERO), |(count, sum), (z, _)| {
+            (count + 1, sum + z)
+        });
+    let mean = sum / count.max(1) as f64;
     let g = |shift: usize| {
         (0..values.len() - shift)
             .filter(|&x| quiet[x] && quiet[x + shift])
-            .map(|x| (values[x] - mean) * (values[x + shift] - mean))
+            .map(|x| ((values[x] - mean) * (values[x + shift] - mean).conj()).re)
             .sum::<f64>()
     };
     let at_zero = g(0);
@@ -339,37 +358,41 @@ fn region_phase(region: &[Complex64], edge: usize) -> f64 {
     centre
 }
 
-/// Weighted straight line through `(position, phase, weight)`, dropping the
-/// worst outlier until none is left; a line with next to no slope is taken to
-/// have none, and the zero order is then the weighted mean.
 /// The line `p0 + p1 x` (degrees, `x` a fraction of the spectrum) the phases
 /// of `points` lie closest to on the circle: every whole degree of `p1` within
 /// two turns, each with `p0` the weighted circular mean of what is left, keeping
-/// the one whose phases agree best. Blind to whole turns, so no unwrapping.
-fn circular_fit(points: &[(f64, f64, f64)]) -> (f64, f64) {
+/// the one whose phases agree best. Signed spectra use half turns and ±90°.
+fn circular_fit(points: &[(f64, f64, f64)], signed: bool) -> (f64, f64) {
+    let limit = if signed { 90 } else { MAX_P1 };
+    let factor = if signed { 2.0 } else { 1.0 };
     let mut best = (f64::NEG_INFINITY, 0.0, 0.0);
-    for p1 in -MAX_P1..=MAX_P1 {
+    for p1 in -limit..=limit {
         let p1 = f64::from(p1);
         let sum: Complex64 = points
             .iter()
-            .map(|&(x, phase, w)| Complex64::from_polar(w, (phase - p1 * x).to_radians()))
+            .map(|&(x, phase, w)| {
+                Complex64::from_polar(w, (factor * (phase - p1 * x)).to_radians())
+            })
             .sum();
         if sum.norm() > best.0 {
-            best = (sum.norm(), sum.arg().to_degrees(), p1);
+            best = (sum.norm(), sum.arg().to_degrees() / factor, p1);
         }
     }
     (best.1, best.2)
 }
 
-fn regress(points: &mut Vec<(f64, f64, f64)>) -> (f64, f64) {
+/// Weighted line through region phases, dropping outliers. A lone position
+/// determines only zero order; otherwise retain the measured slope, even near
+/// zero, so an added first-order phase is not mistaken for a change in confidence.
+/// Bound signed fits here, so the intercept is fitted to the bounded slope too.
+fn regress(points: &mut Vec<(f64, f64, f64)>, max_slope: f64) -> (f64, f64) {
     loop {
         let total: f64 = points.iter().map(|p| p.2).sum();
         let mx = points.iter().map(|p| p.0 * p.2).sum::<f64>() / total;
         let my = points.iter().map(|p| p.1 * p.2).sum::<f64>() / total;
         let sxx: f64 = points.iter().map(|p| p.2 * (p.0 - mx).powi(2)).sum();
-        let syy: f64 = points.iter().map(|p| p.2 * (p.1 - my).powi(2)).sum();
         let sxy: f64 = points.iter().map(|p| p.2 * (p.0 - mx) * (p.1 - my)).sum();
-        let slope = if sxx > 0.0 { sxy / sxx } else { 0.0 };
+        let slope = if sxx > 0.0 { sxy / sxx } else { 0.0 }.clamp(-max_slope, max_slope);
         let fit = |x: f64| my + slope * (x - mx);
         let worst = points
             .iter()
@@ -383,10 +406,7 @@ fn regress(points: &mut Vec<(f64, f64, f64)>) -> (f64, f64) {
             points.remove(k);
             continue;
         }
-        let correlation = sxy / (sxx * syy).sqrt();
-        // NaN when every phase is the same, which also means no slope.
-        let sloped = correlation.abs() >= MIN_CORRELATION;
-        return if points.len() < 2 || !sloped {
+        return if sxx == 0.0 {
             (my, 0.0)
         } else {
             (my - slope * mx, slope)
@@ -464,6 +484,98 @@ mod tests {
     }
 
     #[test]
+    fn noise_correlation_does_not_depend_on_zero_order_phase() {
+        let data: Vec<_> = (0..1024)
+            .map(|i| {
+                Complex64::new(
+                    (i * 7919 % 997) as f64 / 997.0 - 0.5,
+                    (i as f64 * 0.37).sin(),
+                )
+            })
+            .collect();
+        let quiet = vec![true; data.len()];
+        let expected = correlation_length(&data, &quiet);
+        for angle in [45.0, 90.0, 135.0] {
+            let mut rotated = data.clone();
+            apply(&mut rotated, angle, 0.0, 0.0);
+            assert_eq!(correlation_length(&rotated, &quiet), expected);
+        }
+    }
+
+    #[test]
+    fn small_first_order_is_not_dropped_when_region_phases_scatter() {
+        let mut points = vec![
+            (0.1, 1.0, 1.0),
+            (0.3, -1.0, 1.0),
+            (0.5, 0.0, 1.0),
+            (0.9, 1.0, 1.0),
+        ];
+        let mut shifted = points
+            .iter()
+            .map(|&(x, phase, weight)| (x, phase + 50.0 - 80.0 * x, weight))
+            .collect();
+        let (p0, p1) = regress(&mut points, f64::INFINITY);
+        let (q0, q1) = regress(&mut shifted, f64::INFINITY);
+        assert!((q0 - p0 - 50.0).abs() < 1e-10);
+        assert!((q1 - p1 + 80.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn asymmetric_regions_recover_sparse_spectra_without_reference_phases() {
+        // Close lines make wide regions whose midpoint is not a peak position.
+        let lines = [
+            (0.15, 1.0),
+            (0.38, 0.6),
+            (0.395, 0.5),
+            (0.425, 0.8),
+            (0.433, 0.8),
+            (0.6264, 1.0),
+            (0.6272, 1.0),
+            (0.628, 1.0),
+            (0.751, 0.8),
+            (0.808, 0.6),
+            (0.838, 0.5),
+            (0.855, 0.5),
+        ];
+        let n = 16384;
+        for nucleus in ["1H", "13C"] {
+            for width in [2.0, 4.0, 8.0] {
+                let expected: Vec<Complex64> = (0..n)
+                    .map(|i| {
+                        let line: Complex64 = lines
+                            .iter()
+                            .map(|(c, h)| {
+                                h * width / Complex64::new(width, i as f64 - c * n as f64)
+                            })
+                            .sum();
+                        line + ((i * 7919 % 997) as f64 / 997.0 - 0.5) * 1e-3
+                    })
+                    .collect();
+                let mut metadata = meta(nucleus, n, false);
+                metadata.obs_mhz = 150.0;
+                for (e0, e1) in [(40.0, 60.0), (40.0, 250.0), (-100.0, -260.0)] {
+                    let mut data = expected.clone();
+                    apply(&mut data, e0, e1, 0.0);
+                    let (p0, p1) = auto_phase(&data, &metadata);
+                    apply(&mut data, p0, p1, 0.0);
+                    let error = data
+                        .iter()
+                        .zip(&expected)
+                        .map(|(a, b)| (a.re - b.re).powi(2))
+                        .sum::<f64>();
+                    let signal = expected.iter().map(|z| z.re.powi(2)).sum::<f64>();
+                    let rms = (error / signal).sqrt();
+                    let tolerance = if nucleus == "13C" { 0.005 } else { 0.01 };
+                    assert!(
+                        rms < tolerance,
+                        "{nucleus} width {width}, applied {e0}/{e1}, auto {p0}/{p1}, relative RMS {rms}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn recovers_applied_phase() {
         // 13C is smoothed before its regions are phased; the answer is the same.
         for nucleus in ["1H", "13C"] {
@@ -534,11 +646,36 @@ mod tests {
             (0.7, 0.3),
             (0.9, -0.8),
         ];
-        let (e0, e1) = (40.0, 60.0);
-        let data = dephased(8192, &lines, e0, e1);
-        let (p0, p1) = auto_phase(&data, &meta("13C", 8192, true));
-        assert!(angle_difference(p0, -e0) < 3.0, "p0 {p0}");
-        assert!((p1 + e1).abs() < 4.0, "p1 {p1}");
+        for (e0, e1) in [
+            (40.0, 60.0),
+            (-150.0, 60.0),
+            (40.0, -60.0),
+            (40.0, 90.0),
+            (0.0, 89.9),
+            (0.0, -89.9),
+            (90.0, 89.9),
+            (90.0, -89.9),
+        ] {
+            let mut data = dephased(8192, &lines, e0, e1);
+            let (p0, p1) = auto_phase(&data, &meta("13C", 8192, true));
+            assert!(
+                angle_difference(p0, -e0) < 3.0,
+                "applied {e0}/{e1}, p0 {p0}"
+            );
+            assert!((p1 + e1).abs() < 4.0, "applied {e0}/{e1}, p1 {p1}");
+            apply(&mut data, p0, p1, 0.0);
+            let expected = dephased(8192, &lines, 0.0, 0.0);
+            let error = data
+                .iter()
+                .zip(&expected)
+                .map(|(a, b)| (a.re - b.re).powi(2))
+                .sum::<f64>();
+            let signal = expected.iter().map(|z| z.re.powi(2)).sum::<f64>();
+            assert!(
+                (error / signal).sqrt() < 0.01,
+                "applied {e0}/{e1}: signed RMS"
+            );
+        }
     }
 
     #[test]
